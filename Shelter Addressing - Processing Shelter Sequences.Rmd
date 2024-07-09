@@ -1,0 +1,295 @@
+---
+title: "Shelter Addressing - Processing Shelter Sequences"
+author: "Ben Smith"
+date: "09/07/2024"
+output: html_document
+---
+
+
+# Background
+To minimise error, this version takes four input files:
+  - Structure Footprint
+  - Shelter Footprint
+  - Sequence Lines
+  - Door Location Points
+
+ Each of these 4 layers should be for the same area (e.g. 1 camp).
+
+ This code will:
+    1a. Create new IDs in the structure layer, 
+    1b. join structure IDs (by location) to the shelters.
+    2a. Calculate the length along the sequence lines and save this to the door point layer
+    2b. Join the sequences (by location) to the door points
+    2c. Multiply the Line IDs by 10,000 and add to the line distances.
+    2d. Create a rank from these Convert these lengths into a rank and attach these to the points.
+    2e. Join (by location) door points to shelters.
+    3.  Run through each sub-block and create addresses in rank order.
+    
+    
+This script was used and proven to work effectively. It has since been simplified and generalised, so it is advised that you check the output throughout the processing.
+
+
+# Preamble
+The next few code chunks will load in the necessary packages, load and tidy the relevant files and set the output paths for the finished addresses.
+
+```{r EDIT_THIS}
+# Set the file paths for the four input files ----------------------------
+  # > Add your own filepaths. Make sure that this includes the .shp at the end
+
+shelters_path    <- "....shp"
+structures_path  <- "....shp"
+sequences_path   <- "....shp"
+door_points_path <- "....shp"
+
+# Set the output file paths ---------------------------------------------- 
+  # > Make sure that this includes the .shp at the end!
+shelter_footprint_output_path <- "....shp"
+structure_footprint_output_path <- "....shp"
+
+```
+
+```{r load_tidy}
+# Load packages:
+library(sf) # for dealing with shapefiles
+library(sp) # for counting points in polygon
+library(rgeos) # this is used for reprojecting
+library(dplyr) # this may or may not be used...
+
+# Load in the shapefiles --------------------------------------------------
+shelters   <- st_read(dsn = shelters_path)
+structures <- st_read(dsn = structures_path)
+sequences  <- st_read(dsn = sequences_path)
+door_points <- st_read(dsn = door_points_path)
+```
+
+
+To make the datasets easier to check later, we will crop the structure and shelter polygon data to only include the columns we need. In this example we keep the TYPE and ID columns. Your column names / data will most likely be different.
+```{r KEEP_COLUMNS}
+# Crop the datasets:
+structures <- structures[, c("Type", "ID")]
+shelters   <- shelters[, c("Type", "ID")]
+```
+
+
+```{r load_tidy}
+# Remove empty geometries:
+  # Conversions cannot manage empty geometries. Therefore remove any of these:
+  # https://r-spatial.org/r/2017/03/19/invalid.html#empty-geometries
+  # plot(sequences[!is.na(st_dimension(sequences)),1])
+shelters    <- shelters[!is.na(st_dimension(shelters)), ] # nolint
+structures  <- structures[!is.na(st_dimension(structures)), ]
+sequences   <- sequences[!is.na(st_dimension(sequences)), ]
+door_points <- door_points[!is.na(st_dimension(door_points)), ]
+```
+
+# Multiparts
+There may be instances where there are multipart features in the shapefiles, potentially due to processing errors The following code will take the shapefiles and split them into single parts prior to processing. These multipart features should be checked in GIS, edited and then this script rerun.
+
+```{r}
+# Convert multipart to single part:
+structures = st_cast(x = structures, to = "POLYGON")
+shelters   = st_cast(x = shelters, to = "POLYGON")
+```
+
+# Duplicates
+There are often duplicated features. Remove these. This is basic! There may be an instance where a structure has an additional vertex relative to the shelter outline. Here, we should remove the structure with the extra vertex, not the one that matches the shelter. However, this does not specifically do this. So we may remove the accurate structure instead of the erroneous one.
+  * Instead, you could either remove all vertexes that are not shelter vertexes (risky if there are vertexes that are not snapped) prior to removing duplicated geometries.
+  * Or, snap your structures to your shelters at the end.
+  * Or, recreate the structure footprint by dissolving the shelter footprint.
+  * Or, select those structures that don't exactly match shelters and manually edit.
+  * Or, not worry, because its probably fine...
+
+```{r duplicates}
+# Remove duplicated geometries:
+structures  <- structures[which(!duplicated(structures$geometry)),]
+shelters    <- shelters[which(!duplicated(shelters$geometry)),]
+door_points <- door_points[which(!duplicated(door_points$geometry)),]
+```
+
+Some features are duplicated but with very minor changes (e.g. a vertex added). Therefore removing duplicates based on their geometry wont work. We could remove duplicates based on their global IDs, but there are several that have identical IDs, but are different structures.
+
+It is best to write the shelter file and the structure file, set the transparency to 30-50%, remove the stroke and to check for duplicates manually (removing them when you find them). The code below will create centroids in the polygons, then count the centroids within each and generate a warning is polygon contains multiple centroids (as this means there is a duplicate). 
+
+```{r duplicates}
+# Removing duplicated globalIDs doesn't work. If you want to however, do not remove NA values (i.e. non-shelters).
+  # structures  <- structures[which(!duplicated(structures$globalid, incomparables = NA)),]
+  # shelters    <- shelters[which(!duplicated(shelters$globalid, incomparables = NA)),]
+  # door_points <- door_points[which(!duplicated(door_points$globalid, incomparables = NA)),]
+
+duplicate_check = function(polys){
+  c = st_point_on_surface(polys)
+  c = as_Spatial(c)
+  s = as_Spatial(polys)
+  s$over_ID = 1:nrow(s)
+  o = over(x = c, y = s)
+  w = table(o$over_ID)[table(o$over_ID)>1]
+  return(o[o$over_ID %in% as.numeric(names(w)),])
+}
+
+print("Structure check...............")
+print(duplicate_check(polys = structures)) 
+
+print("Shelter check.................")
+print(duplicate_check(polys = shelters))
+```
+
+# Structure Setup
+Give the structures IDs and join these IDs to the shelters.
+```{r structures}
+
+# Add columns to hold the structure number and shelter letters:
+shelters$ShelterLet <- shelters$struct_num <- rep(NA, nrow(shelters))
+
+# 1a. Create new IDs in the structure layer -------------------------------
+structures$R_str_ID = 1:nrow(structures)
+
+# 1b. join structure (by location) IDs to the shelters --------------------
+shelters = st_join(x = shelters,
+                   y = structures[,"R_str_ID"],
+                   join = st_intersects,
+                   left = TRUE, largest = 1) # largest=1 avoids duplicates
+```
+
+# Sequence Setup
+We will now work on the sequence file. 
+
+Manipulate the door points and the sequences into compatible formats.
+
+Then add the distance along each sequence line at each of the door points to the door point data.
+```{r sequences}
+# 2a. Calculate the length along the sequence lines -----------------------
+
+# Convert to SpatialPointsDataFrame and SpatialLinesDataFrame:
+door_points_SPDF = as(object = door_points, Class = "Spatial")
+
+# Convert sequences to SpatialLinesDataFrame:
+sequences_SPDF = as_Spatial(from = sequences, cast = FALSE, IDs = sequences$id)
+
+# Add the distances along the line to the door points:
+door_points_SPDF$RLineDist <- gProject(spgeom = sequences_SPDF,
+                                       sppoint = door_points_SPDF,
+                                       normalized=FALSE)
+```
+
+Join the door points data to the sequence ID and then convert distances into ranks.
+
+This processes combines the rank with the line ID so that we can control the order of each sequence line in the overall system. In order to ensure that the line ID is the dominant factor, we multiply this by 1,000,000.
+```{r ranking}
+# 2b. Join the sequences IDs (by location) to the door points ---------------
+door_points <- st_join(x = st_as_sf(door_points_SPDF),
+                       # YOU MAY NEED TO UPDATE THE ID FIELD Below
+                       y = st_as_sf(sequences_SPDF["id_n"]), 
+                       join = st_intersects,
+                       left = TRUE)# , largest = 1)
+
+# 2c. Add the Line IDs (x 1,000,000) to the line distances ---------------------
+# Done below.
+
+# 2d. Convert LineDist into a rank and attach these to the points ----------
+  # Check this. 
+door_points$RLineWeight <- (door_points$id_n*1000000) + door_points$RLineDist
+door_points$RLineRank   <- rank(door_points$RLineWeight)
+
+# 2e. Join (by location) door points to shelters --------------------------
+shelters <- st_join(x = shelters, y = door_points["RLineRank"], 
+                    join = st_intersects, left = TRUE, largest = 1)
+  # There are some line ranks that are skipped, I do not know why yet...
+```
+
+# Addresses
+This chunk converts the datasets created above into the actual address system.
+
+This runs through each sub-block and takes addresses each structure in turn.
+
+```{r addressing}
+# 3.  Run through each sub-block and create addresses in rank order. -------
+
+# Do this for structures sub-block by sub-block using structure IDs and LineRanks:
+for(subblock in unique(shelters$CampID)){ # Here we have given all of the shelters in each sub-block a unique 'camp ID' this is not coded here. We are essentially running through each sub-block.
+
+  # Determine which shelters are in this subblock (do not include polygons without LineRanks):
+  structures_in_subblock = which(shelters$CampID == subblock & !is.na(shelters$RLineRank))
+  
+  # Order the shelters based on the LineRank:
+  subblock_order = structures_in_subblock[order(shelters$RLineRank[structures_in_subblock])]
+  
+    # Get the distribution of the structure numbers:
+    dist = rle(shelters$R_str_ID[subblock_order])
+    dist$cumulative_lengths = cumsum(dist$lengths)
+    
+    # Run through each structure:
+    for(i in 1:length(dist$length)){
+      
+      # Get the row indexes of the shelters that make up the structure:
+      ind = (dist$cumulative_lengths[i]-(dist$lengths[i]-1)) : dist$cumulative_lengths[i]
+      
+      # Assign these shelters a structure number:
+      shelters$struct_num[subblock_order][ind] = i
+      
+      # Assign these shelters a shelter letter:
+      shelters$ShelterLet[subblock_order][ind] = LETTERS[-c(9,15)][1:dist$lengths[i]]
+      
+    }
+}
+
+shelters$address = paste0(shelters$CampID, "-",
+                          shelters$struct_num, 
+                          shelters$ShelterLet)
+shelters$address[is.na(shelters$ShelterLet)] = shelters$CampID[is.na(shelters$ShelterLet)] 
+
+# Join the structure numbers to the structure footprint:
+  # Normally we use "largest=TRUE" but in this instance, if the largest 
+  # structure division is not a shelter then it wont be given a structure 
+  # number. Therefore, we join with "largest=FALSE", then order so that the 
+  # structures with numbers are first, then remove the duplicated geometries.
+  # This should leave one structure and it should have a number if appropriate.
+  
+  structures = st_join(structures, shelters[1:nrow(shelters), "struct_num"], 
+                       left = TRUE, largest=FALSE)
+  structures = structures[order(structures$struct_num),]
+  structures = structures[!duplicated(structures$geometry),]
+```
+
+# Output
+
+Write the shelter and structure footprint datasets. These do not overwrite, so make sure that you edit the output paths as desired.
+
+```{r eval=TRUE}
+# eval=TRUE/FALSE means that this will/wont be run, change as needed
+  
+st_write(obj = shelters[1:nrow(shelters),], dsn = shelter_footprint_output_path)
+
+st_write(structures, dsn = structure_footprint_output_path)
+
+```
+
+```{r eval=FALSE}
+
+# Address checks ----------------------------------------------------------
+
+# Check whether there are any shelter letters greater than Z:
+if(length(which(shelters$ShelterLet = "Z"))>0){
+  warning(paste0("Warning: there are ", 
+                 length(which(shelters$ShelterLet = "Z")),
+                 " Z's in the shelter letters. ",
+                 "Check that there are no more than 26 shelters per structure."))}
+
+# Check whether there are any shelters that have two door points:
+door_count = st_intersection(x = shelters, y = door_points)
+door_count <- door_count %>% group_by(address) %>% count()
+door_count <- door_count[which(door_count$n>1),]
+plot(door_count)
+
+# Check that all shelters also have structures:
+
+# Check that all structures also have shelters:
+
+# Check that there are not multiple polygons that have the same ID - i.e. are split features - e.g. C03_F Structure 54
+
+# >>> There may still be duplicates in the shelters, so check these visually as well
+
+```
+
+
+
+
