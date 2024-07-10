@@ -1,0 +1,26 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: >-
+  https://github.com/DrBenSmith/Methodology for Creating
+  Shelter Addresses in Complex Settings or Refugee Camps
+message: >-
+  If using this software please reference it using the given
+  citation (or similar).
+type: software
+authors:
+  - given-names: Ben
+    family-names: Smith
+    email: Dr.Ben.Smith@outlook.com
+repository-code: >-
+  https://github.com/DrBenSmith/Methodology-for-Creating-Shelter-Addresses-in-Complex-Settings-or-Refugee-Camps
+keywords:
+  - Refugee Camp
+  - Shelter
+  - Address
+  - Rohingya
+  - Bangladesh
+  - Methodology
+license: CC-BY-4.0
+date-released: '2024-07-10'
